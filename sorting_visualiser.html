@@ -1,0 +1,555 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Sorting Visualizer</title>
+<style>
+  :root{
+    --box-w: 92px;
+    --box-h: 72px;
+    --gap: 18px;
+    --bg-unsorted: #8DD3FF;  /* blue */
+    --bg-sorted: #A5F2A5;    /* green */
+    --bg-compare: #FFD97D;   /* yellow */
+    --text: #0a0a0a;
+    --swap-color: #E53935;   /* red */
+    --compare-color: #1E88E5;/* blue */
+    --move-color: #FB8C00;   /* orange */
+    --arrow-width: 3;
+  }
+  body { font-family: system-ui, Arial; margin:20px; color:var(--text) }
+  h2 { margin: 0 0 10px 0; }
+  #controls { margin-bottom:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;}
+  input[type="text"]{ padding:6px; font-size:15px; width:420px }
+  select{ padding:6px; font-size:15px }
+  button{ padding:8px 12px; font-size:15px; cursor:pointer }
+  #stageWrap { width:100%; max-width:980px; background: #fff; padding:10px; box-sizing:border-box; position:relative; }
+  #stage { position:relative; height:240px; min-height:240px; }
+  .box {
+    position:absolute;
+    width:var(--box-w);
+    height:var(--box-h);
+    border:2px solid #222;
+    border-radius:8px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-weight:800;
+    font-size:24px;
+    color:#030303;
+    transition: left 250ms, top 250ms, background 200ms;
+    box-sizing:border-box;
+  }
+  .unsorted { background: var(--bg-unsorted); }
+  .sorted   { background: var(--bg-sorted); }
+  .compare  { background: var(--bg-compare); }
+  svg { position:absolute; left:0; top:0; pointer-events:none; overflow:visible; }
+  #playControls { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  #status { font-weight:700 }
+  #passStep { font-weight:700; color: #1a237e }
+  label.small { font-size:13px; color:#333; margin-left:8px }
+
+  /* Arrow flow animation - uses stroke-dashoffset animation */
+  @keyframes flow {
+    to { stroke-dashoffset: 0; }
+  }
+</style>
+</head>
+<body>
+
+<h2>Sorting Visualizer</h2>
+
+<div id="controls">
+  <label>Values:</label>
+  <input id="inputArray" type="text" value="4, 3, 10, 1, -6, 2" />
+  <label>Algorithm:</label>
+  <select id="algo">
+    <option value="insertion">Insertion</option>
+    <option value="bubble">Bubble</option>
+    <option value="selection">Selection</option>
+  </select>
+
+  <button id="runBtn">Run</button>
+  <button id="resetBtn">Reset</button>
+
+  <span class="small">Speed:</span>
+  <input id="speed" type="range" min="100" max="1500" step="50" value="600" />
+  <span id="speedLabel" class="small">600ms</span>
+</div>
+
+<div id="stageWrap">
+  <div id="stage"></div>
+  <svg id="svgLayer"></svg>
+</div>
+
+<div id="playControls">
+  <button id="prevBtn">Prev</button>
+  <button id="playBtn">Play</button>
+  <button id="nextBtn">Next</button>
+  <span id="status">Step: 0 / 0</span>
+  <span id="passStep">Pass: 0 • Step: 0</span>
+</div>
+
+<script>
+/* ---------- Layout params ---------- */
+const BOX_W = 92, BOX_H = 72, GAP = 18;
+const X0 = 18, Y0 = 80;
+
+const stage = document.getElementById('stage');
+const svg   = document.getElementById('svgLayer');
+let boxes = [];   // DOM elements for boxes
+let steps = [];   // {after:[], swap:[i,j] or null, type:'swap'|'compare'|'move', pass, stepInPass, sortedUpto, compare? }
+let idx = 0;
+let timer = null;
+let playing = false;
+
+/* ---------- Helpers ---------- */
+function parseInputArray(txt){
+  return txt.split(',').map(s=>Number(s.trim())).filter(n=>!Number.isNaN(n));
+}
+
+function sizeSvg(){
+  const r = stage.getBoundingClientRect();
+  svg.setAttribute('width', r.width);
+  svg.setAttribute('height', r.height);
+  svg.style.left = stage.offsetLeft + 'px';
+  svg.style.top  = stage.offsetTop + 'px';
+}
+
+function clearSvg(){
+  while(svg.firstChild) svg.removeChild(svg.firstChild);
+}
+
+/* create boxes representing 'values' on stage (absolute positioned) */
+function createBoxes(values){
+  boxes.forEach(b=>b.remove());
+  boxes = [];
+  for(let i=0;i<values.length;i++){
+    const d = document.createElement('div');
+    d.className = 'box unsorted';
+    d.style.left = (X0 + i*(BOX_W + GAP)) + 'px';
+    d.style.top  = Y0 + 'px';
+    d.textContent = values[i];
+    stage.appendChild(d);
+    boxes.push(d);
+  }
+  // ensure svg sized after DOM insertion
+  setTimeout(sizeSvg, 20);
+}
+
+/* update text and shading with sortedUpto and optionally highlight compare indices */
+function updateBoxes(values, sortedUpto=null, compare=null){
+  for(let i=0;i<values.length;i++){
+    boxes[i].textContent = values[i];
+    boxes[i].style.left = (X0 + i*(BOX_W + GAP)) + 'px';
+    if(compare && (i===compare[0] || i===compare[1])){
+      boxes[i].className = 'box compare';
+    } else if(sortedUpto !== null && i <= sortedUpto){
+      boxes[i].className = 'box sorted';
+    } else {
+      boxes[i].className = 'box unsorted';
+    }
+  }
+}
+
+/* create SVG marker with arrowhead */
+function ensureMarker(id, color) {
+  const ns = "http://www.w3.org/2000/svg";
+
+  // If already created, stop
+  if (document.getElementById(id + "_L") && document.getElementById(id + "_R"))
+    return id;
+
+  const defs = document.createElementNS(ns, "defs");
+
+  // RIGHT arrowhead → 
+  const markerR = document.createElementNS(ns, "marker");
+  markerR.setAttribute("id", id + "_R");
+  markerR.setAttribute("markerWidth", "12");
+  markerR.setAttribute("markerHeight", "12");
+  markerR.setAttribute("refX", "12");
+  markerR.setAttribute("refY", "6");
+  markerR.setAttribute("orient", "auto");
+
+  const pathR = document.createElementNS(ns, "path");
+  pathR.setAttribute("d", "M0,0 L12,6 L0,12 z");
+  pathR.setAttribute("fill", color);
+  markerR.appendChild(pathR);
+
+  // LEFT arrowhead ← 
+  const markerL = document.createElementNS(ns, "marker");
+  markerL.setAttribute("id", id + "_L");
+  markerL.setAttribute("markerWidth", "12");
+  markerL.setAttribute("markerHeight", "12");
+  markerL.setAttribute("refX", "0");
+  markerL.setAttribute("refY", "6");
+  markerL.setAttribute("orient", "auto");
+
+  const pathL = document.createElementNS(ns, "path");
+  pathL.setAttribute("d", "M12,0 L0,6 L12,12 z");
+  pathL.setAttribute("fill", color);
+  markerL.appendChild(pathL);
+
+  defs.appendChild(markerR);
+  defs.appendChild(markerL);
+  svg.appendChild(defs);
+
+  return id;
+}
+
+
+/* draw curved arrow with color/style/type.
+   type: 'swap' -> red solid double-headed
+         'compare' -> blue dashed double-headed
+         'move' -> orange solid double-headed (insertion shifts)
+   (This is the single kept drawCurvedArrow implementation)
+*/
+function drawCurvedArrow(i, j, type='swap', label=''){
+  clearSvg();
+  if(i==null || j==null) return;
+
+  const r = stage.getBoundingClientRect();
+  const b0 = boxes[i].getBoundingClientRect();
+  const b1 = boxes[j].getBoundingClientRect();
+  const x1 = (b0.left - r.left) + b0.width/2;
+  const x2 = (b1.left - r.left) + b1.width/2;
+  const y  = (b0.top - r.top) - 6;
+  const mx = (x1 + x2)/2;
+  const dist = Math.abs(x2 - x1);
+  const ctrlY = y - Math.max(50, dist*0.25);
+
+  const ns = "http://www.w3.org/2000/svg";
+  const path = document.createElementNS(ns,'path');
+  const d = `M ${x1} ${y} Q ${mx} ${ctrlY} ${x2} ${y}`;
+  path.setAttribute('d', d);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke-linecap', 'round');
+
+  let strokeColor = getComputedStyle(document.documentElement).getPropertyValue('--swap-color').trim();
+  let strokeWidth = Number(getComputedStyle(document.documentElement).getPropertyValue('--arrow-width'));
+  let dash = '';
+  let markerId = 'arrowHeadSwap';
+
+  if(type === 'compare'){
+    strokeColor = getComputedStyle(document.documentElement).getPropertyValue('--compare-color').trim();
+    dash = '6,6';
+    markerId = 'arrowHeadCompare';
+  } else if(type === 'move'){
+    strokeColor = getComputedStyle(document.documentElement).getPropertyValue('--move-color').trim();
+    markerId = 'arrowHeadMove';
+  } else { // swap
+    markerId = 'arrowHeadSwap';
+  }
+
+  // ensure marker for chosen color exists
+  ensureMarker(markerId, strokeColor);
+
+  path.setAttribute('stroke', strokeColor);
+  path.setAttribute('stroke-width', strokeWidth);
+  if(dash) path.setAttribute('stroke-dasharray', dash);
+
+  // BOTH arrowheads
+  path.setAttribute('marker-start', `url(#${markerId})`);
+  path.setAttribute('marker-end', `url(#${markerId})`);
+
+  // For animated flow: create a long dash and animate stroke-dashoffset via CSS animation.
+  // We use a large dash length and animate offset from dash length to 0.
+  const speed = Number(document.getElementById('speed').value) || 600;
+  // For solid arrows show animated "flow"; for dashed compare arrow we keep dashed but animate offset too.
+  const totalLen = 1200; // large number works for visual flow (not exact path length but OK)
+  path.setAttribute('stroke-dasharray', totalLen);
+  path.setAttribute('stroke-dashoffset', totalLen);
+  // apply CSS animation (duration = speed)
+  path.style.animation = `flow ${speed}ms linear forwards`;
+
+  svg.appendChild(path);
+
+  if(label){
+    const txt = document.createElementNS(ns,'text');
+    txt.setAttribute('x', mx);
+    txt.setAttribute('y', ctrlY - 8);
+    txt.setAttribute('text-anchor', 'middle');
+    txt.setAttribute('font-size', '13');
+    txt.setAttribute('font-weight', '600');
+    txt.textContent = label;
+    svg.appendChild(txt);
+  }
+}
+
+/* ---------- Sorting step generators (with types) ---------- */
+
+/* ---------- computeInsertion (fixed for synced steps)
+   Emits steps shaped { after, swap, type, pass, stepInPass, sortedUpto }
+   Logic: standard insertion via adjacent shifts; records initial compare, shifts (move), and final placement.
+*/
+function computeInsertion(arr){
+  let a = arr.slice();
+  const S = [];
+  const n = a.length;
+
+  for(let i=1; i<n; i++){
+    let k = i;
+    let stepInPass = 0;
+
+    // initial comparison between k-1 and k (if exists)
+    if(k-1 >= 0){
+      stepInPass++;
+      S.push({
+        after: a.slice(),
+        swap: [k-1, k],
+        type: 'compare',
+        pass: i,
+        stepInPass,
+        sortedUpto: i
+      });
+    }
+
+    // shift while previous element > current
+    while(k > 0 && a[k] < a[k-1]){
+      // perform shift
+      [a[k], a[k-1]] = [a[k-1], a[k]];
+      stepInPass++;
+      S.push({
+        after: a.slice(),
+        swap: [k-1, k],
+        type: 'move',
+        pass: i,
+        stepInPass,
+        sortedUpto: i
+      });
+      k--;
+
+      // if another comparison will occur, record it (between new k-1 and k)
+      if(k-1 >= 0){
+        stepInPass++;
+        S.push({
+          after: a.slice(),
+          swap: [k-1, k],
+          type: 'compare',
+          pass: i,
+          stepInPass,
+          sortedUpto: i
+        });
+      }
+    }
+
+    // if nothing happened (no compare recorded), ensure we still show the pass (keeps UI consistent)
+    if(stepInPass === 0){
+      S.push({
+        after: a.slice(),
+        swap: null,
+        type: 'compare',
+        pass: i,
+        stepInPass: 0,
+        sortedUpto: i
+      });
+    }
+  }
+
+  // final state
+  S.push({
+    after: a.slice(),
+    swap: null,
+    type: 'compare',
+    pass: n-1,
+    stepInPass: 0,
+    sortedUpto: n
+  });
+
+  return S;
+}
+
+/* ---------- computeBubble (fixed & synced) ---------- */
+function computeBubble(arr){
+  let a = arr.slice();
+  let S = [];
+  let n = a.length;
+
+  for (let pass = 1; pass <= n - 1; pass++) {
+    let stepInPass = 0;
+
+    for (let j = 0; j < n - pass; j++) {
+
+      stepInPass++;
+
+      // Compare event
+      S.push({
+        after: a.slice(),
+        swap: [j, j+1],
+        type: "compare",
+        pass,
+        stepInPass,
+        sortedUpto: n - pass
+      });
+
+      // Swap event
+      if (a[j] > a[j+1]) {
+        [a[j], a[j+1]] = [a[j+1], a[j]];
+
+        S.push({
+          after: a.slice(),
+          swap: [j, j+1],
+          type: "swap",
+          pass,
+          stepInPass,   // <-- NO HALF STEPS
+          sortedUpto: n - pass
+        });
+      }
+    }
+
+    // Pass-end marker (same format as others)
+    S.push({
+      after: a.slice(),
+      swap: null,
+      type: "pass-end",
+      pass,
+      stepInPass: 0,
+      sortedUpto: n - pass
+    });
+  }
+
+  return S;
+}
+
+
+
+/* ---------- computeSelection (fixed: compare min vs j, swap once after inner loop)
+   Emits steps in same format as bubble so UI remains synced.
+*/
+function computeSelection(arr){
+  let a=arr.slice(), S=[], n=a.length;
+  for(let i=0;i<n-1;i++){
+    let minIdx = i, stepInPass = 0;
+
+    for(let j=i+1;j<n;j++){
+      stepInPass++;
+      // comparison is between current minIdx and j
+      S.push({
+        after: a.slice(),
+        swap: [minIdx, j],
+        type: 'compare',
+        pass: i+1,
+        stepInPass,
+        sortedUpto: i-1
+      });
+
+      if(a[j] < a[minIdx]){
+        minIdx = j;
+      }
+    }
+
+    // after inner loop, swap once if min changed
+    if(minIdx !== i){
+      [a[i], a[minIdx]] = [a[minIdx], a[i]];
+      stepInPass++;
+      S.push({
+        after: a.slice(),
+        swap: [i, minIdx],
+        type: 'swap',
+        pass: i+1,
+        stepInPass,
+        sortedUpto: i
+      });
+    } else {
+      // no swap needed — push a pass-completion step for UI continuity
+      stepInPass++;
+      S.push({
+        after: a.slice(),
+        swap: null,
+        type: 'compare',
+        pass: i+1,
+        stepInPass,
+        sortedUpto: i
+      });
+    }
+  }
+  S.push({after:a.slice(),swap:null,type:'compare',pass:n-1,stepInPass:0,sortedUpto:n});
+  return S;
+}
+
+/* ---------- Controller / rendering ---------- */
+
+function prepareSteps(values, algo){
+  if(algo==='insertion') return computeInsertion(values);
+  if(algo==='bubble') return computeBubble(values);
+  if(algo==='selection') return computeSelection(values);
+  return [];
+}
+
+function renderIndex(i){
+  if(!steps.length) return;
+  if(i<0) i=0;
+  if(i>=steps.length) i=steps.length-1;
+  idx = i;
+  const s = steps[i];
+  if(!boxes.length || boxes.length !== s.after.length) createBoxes(s.after);
+
+  // compare highlight: for compute functions we set swap field to indicate indices; for compare type we still use that to highlight
+  const compare = (s.type === 'compare' && s.swap) ? s.swap : (s.swap && s.type!=='compare' ? s.swap : null);
+  updateBoxes(s.after, s.sortedUpto, compare);
+
+  if (s.swap && s.swap[0] !== s.swap[1]) {
+    if (s.type === 'swap') drawCurvedArrow(s.swap[0], s.swap[1], 'swap', 'swap');
+    else if (s.type === 'compare') drawCurvedArrow(s.swap[0], s.swap[1], 'compare', 'compare');
+    else if (s.type === 'move') drawCurvedArrow(s.swap[0], s.swap[1], 'move', 'shift');
+  } else {
+    clearSvg();
+  }
+
+  document.getElementById('status').textContent = `Step: ${i+1} / ${steps.length}`;
+  document.getElementById('passStep').textContent = `Pass: ${s.pass} • Step: ${s.stepInPass}`;
+}
+
+/* ---------- Playback ---------- */
+function stopPlayback(){
+  if(timer) clearInterval(timer);
+  playing=false;
+  document.getElementById('playBtn').textContent='Play';
+}
+
+function startPlayback(){
+  stopPlayback();
+  playing=true;
+  document.getElementById('playBtn').textContent='Pause';
+  const speed = Number(document.getElementById('speed').value);
+  timer = setInterval(()=>{
+    if(idx < steps.length-1) renderIndex(idx+1);
+    else stopPlayback();
+  }, speed);
+}
+
+/* ---------- UI wiring ---------- */
+
+window.addEventListener('resize', ()=>{ sizeSvg(); });
+
+document.getElementById('runBtn').addEventListener('click', ()=>{
+  stopPlayback();
+  clearSvg();
+  const values = parseInputArray(document.getElementById('inputArray').value);
+  if(values.length === 0){ alert('Enter at least one number.'); return; }
+  steps = prepareSteps(values, document.getElementById('algo').value);
+  renderIndex(0);
+});
+
+document.getElementById('resetBtn').addEventListener('click', ()=>{
+  stopPlayback();
+  steps = []; idx = 0; clearSvg();
+  boxes.forEach(b=>b.remove()); boxes = [];
+  document.getElementById('status').textContent = 'Step: 0 / 0';
+  document.getElementById('passStep').textContent = 'Pass: 0 • Step: 0';
+});
+
+document.getElementById('prevBtn').addEventListener('click', ()=>{ stopPlayback(); renderIndex(Math.max(0, idx-1)); });
+document.getElementById('nextBtn').addEventListener('click', ()=>{ stopPlayback(); renderIndex(Math.min(steps.length-1, idx+1)); });
+document.getElementById('playBtn').addEventListener('click', ()=>{ if(playing) stopPlayback(); else startPlayback(); });
+document.getElementById('speed').addEventListener('input', e=>{
+  document.getElementById('speedLabel').textContent = e.target.value + 'ms';
+  if(playing){ startPlayback(); }
+});
+
+/* initial sizing */
+sizeSvg();
+
+</script>
+</body>
+</html>
