@@ -10,10 +10,9 @@
     --gap: 18px;
     --bg-unsorted: #8DD3FF;  /* blue */
     --bg-sorted: #A5F2A5;    /* green */
-    --bg-compare: #FFD97D;   /* yellow */
     --text: #0a0a0a;
     --swap-color: #E53935;   /* red */
-    --compare-color: #1E88E5;/* blue */
+    --compare-color: #1E88E5;/* blue (arrow color only) */
     --move-color: #FB8C00;   /* orange */
     --arrow-width: 3;
   }
@@ -42,12 +41,29 @@
   }
   .unsorted { background: var(--bg-unsorted); }
   .sorted   { background: var(--bg-sorted); }
-  .compare  { background: var(--bg-compare); }
+  .compare  { background: var(--bg-unsorted); } /* visually same background as unsorted */
   svg { position:absolute; left:0; top:0; pointer-events:none; overflow:visible; }
   #playControls { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   #status { font-weight:700 }
-  #passStep { font-weight:700; color: #1a237e }
+  #passStep { font-weight:700; color: #1a237e; min-width:180px; text-align:center; }
   label.small { font-size:13px; color:#333; margin-left:8px }
+
+  /* PASS COMPLETED banner */
+  .preview-banner {
+    position:absolute;
+    left:50%;
+    transform:translateX(-50%);
+    top:12px;
+    background: rgba(26,35,126,0.06);
+    border:1px solid rgba(26,35,126,0.12);
+    padding:6px 12px;
+    border-radius:8px;
+    font-weight:800;
+    color:#1a237e;
+    pointer-events:none;
+    z-index:20;
+    letter-spacing:0.6px;
+  }
 
   /* Arrow flow animation - uses stroke-dashoffset animation */
   @keyframes flow {
@@ -80,6 +96,7 @@
 <div id="stageWrap">
   <div id="stage"></div>
   <svg id="svgLayer"></svg>
+  <!-- preview banner will be injected here when showing pass-preview -->
 </div>
 
 <div id="playControls">
@@ -97,8 +114,9 @@ const X0 = 18, Y0 = 80;
 
 const stage = document.getElementById('stage');
 const svg   = document.getElementById('svgLayer');
+const stageWrap = document.getElementById('stageWrap');
 let boxes = [];   // DOM elements for boxes
-let steps = [];   // {after:[], swap:[i,j] or null, type:'swap'|'compare'|'move', pass, stepInPass, sortedUpto, compare? }
+let steps = [];   // array of step objects
 let idx = 0;
 let timer = null;
 let playing = false;
@@ -137,17 +155,38 @@ function createBoxes(values){
   setTimeout(sizeSvg, 20);
 }
 
-/* update text and shading with sortedUpto and optionally highlight compare indices */
-function updateBoxes(values, sortedUpto=null, compare=null){
+/*
+  Update boxes:
+  - values: array of numbers
+  - sorted: null | {type:'prefix', end: idx} | {type:'suffix', start: idx}
+  - compare: optional [i,j] indices involved in a compare (we do not change bg for compare)
+*/
+function updateBoxes(values, sorted=null, compare=null){
   for(let i=0;i<values.length;i++){
     boxes[i].textContent = values[i];
     boxes[i].style.left = (X0 + i*(BOX_W + GAP)) + 'px';
-    if(compare && (i===compare[0] || i===compare[1])){
-      boxes[i].className = 'box compare';
-    } else if(sortedUpto !== null && i <= sortedUpto){
+
+    // default unsorted
+    let isSorted = false;
+    if(sorted){
+      if(sorted.type === 'prefix' && typeof sorted.end === 'number'){
+        if(i <= sorted.end) isSorted = true;
+      } else if(sorted.type === 'suffix' && typeof sorted.start === 'number'){
+        if(i >= sorted.start) isSorted = true;
+      }
+    }
+
+    if(isSorted){
       boxes[i].className = 'box sorted';
     } else {
       boxes[i].className = 'box unsorted';
+    }
+
+    // Add/remove compare class for optional subtle styling (but bg unchanged)
+    if(compare && (i === compare[0] || i === compare[1])){
+      boxes[i].classList.add('compare');
+    } else {
+      boxes[i].classList.remove('compare');
     }
   }
 }
@@ -202,11 +241,11 @@ function ensureMarker(id, color) {
    type: 'swap' -> red solid double-headed
          'compare' -> blue dashed double-headed
          'move' -> orange solid double-headed (insertion shifts)
-   (This is the single kept drawCurvedArrow implementation)
 */
 function drawCurvedArrow(i, j, type='swap', label=''){
   clearSvg();
   if(i==null || j==null) return;
+  if(!boxes[i] || !boxes[j]) return;
 
   const r = stage.getBoundingClientRect();
   const b0 = boxes[i].getBoundingClientRect();
@@ -252,14 +291,11 @@ function drawCurvedArrow(i, j, type='swap', label=''){
   path.setAttribute('marker-start', `url(#${markerId})`);
   path.setAttribute('marker-end', `url(#${markerId})`);
 
-  // For animated flow: create a long dash and animate stroke-dashoffset via CSS animation.
-  // We use a large dash length and animate offset from dash length to 0.
+  // animated flow
   const speed = Number(document.getElementById('speed').value) || 600;
-  // For solid arrows show animated "flow"; for dashed compare arrow we keep dashed but animate offset too.
-  const totalLen = 1200; // large number works for visual flow (not exact path length but OK)
+  const totalLen = 1200;
   path.setAttribute('stroke-dasharray', totalLen);
   path.setAttribute('stroke-dashoffset', totalLen);
-  // apply CSS animation (duration = speed)
   path.style.animation = `flow ${speed}ms linear forwards`;
 
   svg.appendChild(path);
@@ -276,110 +312,151 @@ function drawCurvedArrow(i, j, type='swap', label=''){
   }
 }
 
-/* ---------- Sorting step generators (with types) ---------- */
-
-/* ---------- computeInsertion (fixed for synced steps)
-   Emits steps shaped { after, swap, type, pass, stepInPass, sortedUpto }
-   Logic: standard insertion via adjacent shifts; records initial compare, shifts (move), and final placement.
+/* ---------- Sorting step generators (with types) ----------
+   Each step object format:
+   {
+     after: [...],
+     swap: [i,j] | null,
+     type: 'compare'|'swap'|'move'|'pass-end'|'pass-preview'|'initial'|'final',
+     pass: n,
+     stepInPass: k,
+     sorted: null | {type:'prefix', end: idx} | {type:'suffix', start: idx}
+   }
 */
+
+/* ---------- computeInsertion (left unchanged) ---------- */
 function computeInsertion(arr){
   let a = arr.slice();
   const S = [];
   const n = a.length;
 
-  for(let i=1; i<n; i++){
-    let k = i;
+  // Initial: first element considered sorted
+  S.push({
+    after: a.slice(),
+    swap: null,
+    type: 'initial',
+    pass: 0,
+    stepInPass: 0,
+    sorted: { type: 'prefix', end: 0 }
+  });
+
+  for(let pass = 1; pass < n; pass++){
+    let k = pass;
     let stepInPass = 0;
 
-    // initial comparison between k-1 and k (if exists)
+    // initial compare: between k-1 and k, sorted prefix is 0..(pass-1)
     if(k-1 >= 0){
       stepInPass++;
       S.push({
         after: a.slice(),
         swap: [k-1, k],
         type: 'compare',
-        pass: i,
+        pass: pass,
         stepInPass,
-        sortedUpto: i
+        sorted: { type: 'prefix', end: pass - 1 }
       });
     }
 
-    // shift while previous element > current
     while(k > 0 && a[k] < a[k-1]){
-      // perform shift
       [a[k], a[k-1]] = [a[k-1], a[k]];
       stepInPass++;
       S.push({
         after: a.slice(),
         swap: [k-1, k],
         type: 'move',
-        pass: i,
+        pass: pass,
         stepInPass,
-        sortedUpto: i
+        sorted: { type: 'prefix', end: pass - 1 }
       });
       k--;
 
-      // if another comparison will occur, record it (between new k-1 and k)
       if(k-1 >= 0){
         stepInPass++;
         S.push({
           after: a.slice(),
           swap: [k-1, k],
           type: 'compare',
-          pass: i,
+          pass: pass,
           stepInPass,
-          sortedUpto: i
+          sorted: { type: 'prefix', end: pass - 1 }
         });
       }
     }
 
-    // if nothing happened (no compare recorded), ensure we still show the pass (keeps UI consistent)
-    if(stepInPass === 0){
+    // pass-end: prefix extended
+    S.push({
+      after: a.slice(),
+      swap: null,
+      type: 'pass-end',
+      pass: pass,
+      stepInPass: stepInPass + 1,
+      sorted: { type: 'prefix', end: pass }
+    });
+
+    // preview (start of next pass) — show PASS COMPLETED (only if not final)
+    if(pass < n - 1){
       S.push({
         after: a.slice(),
         swap: null,
-        type: 'compare',
-        pass: i,
+        type: 'pass-preview',
+        pass: pass,
         stepInPass: 0,
-        sortedUpto: i
+        sorted: { type: 'prefix', end: pass }
       });
     }
   }
 
-  // final state
   S.push({
     after: a.slice(),
     swap: null,
-    type: 'compare',
+    type: 'final',
     pass: n-1,
     stepInPass: 0,
-    sortedUpto: n
+    sorted: { type: 'prefix', end: n-1 }
   });
 
   return S;
 }
 
-/* ---------- computeBubble (fixed & synced) ---------- */
-function computeBubble(arr){
+/* ---------- cmputeBubble (ONLY this function changed) ----------
+   Behavior:
+   - During pass p, keep previously-fixed suffix green:
+       sorted.start = n - (p - 1)  (which equals n when none are fixed)
+   - After inner loop, push a single pass-preview step (no stray step:0)
+       preview sorted.start = n - p
+*/
+function cmputeBubble(arr){
   let a = arr.slice();
   let S = [];
   let n = a.length;
+
+  // initial state: nothing sorted
+  S.push({
+    after: a.slice(),
+    swap: null,
+    type: 'initial',
+    pass: 0,
+    stepInPass: 0,
+    sorted: { type: 'suffix', start: n } // none sorted
+  });
 
   for (let pass = 1; pass <= n - 1; pass++) {
     let stepInPass = 0;
 
     for (let j = 0; j < n - pass; j++) {
-
       stepInPass++;
 
-      // Compare event
+      // compute suffix start that is already fixed from previous passes
+      const alreadyFixedStart = n - (pass - 1); // equals n when none fixed
+
+      // Compare event: show previously fixed suffix green, but not the new one yet
       S.push({
         after: a.slice(),
         swap: [j, j+1],
         type: "compare",
         pass,
         stepInPass,
-        sortedUpto: n - pass
+        sorted: { type: 'suffix', start: alreadyFixedStart }
       });
 
       // Swap event
@@ -391,46 +468,65 @@ function computeBubble(arr){
           swap: [j, j+1],
           type: "swap",
           pass,
-          stepInPass,   // <-- NO HALF STEPS
-          sortedUpto: n - pass
+          stepInPass,
+          sorted: { type: 'suffix', start: alreadyFixedStart }
         });
       }
     }
 
-    // Pass-end marker (same format as others)
+    // After the pass completes, the newly-fixed element index is n - pass
+    // Instead of pushing a stray step:0 we push a single pass-preview step which shows PASS COMPLETED
     S.push({
       after: a.slice(),
       swap: null,
-      type: "pass-end",
+      type: "pass-preview",
       pass,
       stepInPass: 0,
-      sortedUpto: n - pass
+      sorted: { type: 'suffix', start: n - pass } // newly fixed suffix
     });
+
+    // (no separate pass-end step so there's no stray "Step: 0" render)
   }
+
+  // final state: everything sorted (suffix start 0)
+  S.push({
+    after: a.slice(),
+    swap: null,
+    type: "final",
+    pass: n-1,
+    stepInPass: 0,
+    sorted: { type: 'suffix', start: 0 }
+  });
 
   return S;
 }
 
-
-
-/* ---------- computeSelection (fixed: compare min vs j, swap once after inner loop)
-   Emits steps in same format as bubble so UI remains synced.
-*/
+/* ---------- computeSelection (left unchanged) ---------- */
 function computeSelection(arr){
   let a=arr.slice(), S=[], n=a.length;
+
+  // initial state: none sorted
+  S.push({
+    after: a.slice(),
+    swap: null,
+    type: 'initial',
+    pass: 0,
+    stepInPass: 0,
+    sorted: { type: 'prefix', end: -1 }
+  });
+
   for(let i=0;i<n-1;i++){
     let minIdx = i, stepInPass = 0;
 
     for(let j=i+1;j<n;j++){
       stepInPass++;
-      // comparison is between current minIdx and j
       S.push({
         after: a.slice(),
         swap: [minIdx, j],
         type: 'compare',
         pass: i+1,
         stepInPass,
-        sortedUpto: i-1
+        sorted: { type: 'prefix', end: i-1 } // before placing i
       });
 
       if(a[j] < a[minIdx]){
@@ -438,7 +534,6 @@ function computeSelection(arr){
       }
     }
 
-    // after inner loop, swap once if min changed
     if(minIdx !== i){
       [a[i], a[minIdx]] = [a[minIdx], a[i]];
       stepInPass++;
@@ -448,22 +543,33 @@ function computeSelection(arr){
         type: 'swap',
         pass: i+1,
         stepInPass,
-        sortedUpto: i
+        sorted: { type: 'prefix', end: i }
       });
     } else {
-      // no swap needed — push a pass-completion step for UI continuity
-      stepInPass++;
       S.push({
         after: a.slice(),
         swap: null,
-        type: 'compare',
+        type: 'pass-end',
         pass: i+1,
         stepInPass,
-        sortedUpto: i
+        sorted: { type: 'prefix', end: i }
+      });
+    }
+
+    // PASS PREVIEW — show PASS COMPLETED (prefix extended)
+    if(i < n - 2){
+      S.push({
+        after: a.slice(),
+        swap: null,
+        type: 'pass-preview',
+        pass: i+1,
+        stepInPass: 0,
+        sorted: { type: 'prefix', end: i }
       });
     }
   }
-  S.push({after:a.slice(),swap:null,type:'compare',pass:n-1,stepInPass:0,sortedUpto:n});
+
+  S.push({after:a.slice(),swap:null,type:'final',pass:n-1,stepInPass:0,sorted:{type:'prefix',end:n-1}});
   return S;
 }
 
@@ -471,9 +577,24 @@ function computeSelection(arr){
 
 function prepareSteps(values, algo){
   if(algo==='insertion') return computeInsertion(values);
-  if(algo==='bubble') return computeBubble(values);
+  if(algo==='bubble') return cmputeBubble(values); // uses the function name you provided
   if(algo==='selection') return computeSelection(values);
   return [];
+}
+
+/* remove any existing preview banner */
+function removePreviewBanner(){
+  const existing = document.getElementById('previewBanner');
+  if(existing) existing.remove();
+}
+
+function showPreviewBanner(){
+  removePreviewBanner();
+  const b = document.createElement('div');
+  b.id = 'previewBanner';
+  b.className = 'preview-banner';
+  b.textContent = 'PASS COMPLETED';
+  stageWrap.appendChild(b);
 }
 
 function renderIndex(i){
@@ -484,20 +605,36 @@ function renderIndex(i){
   const s = steps[i];
   if(!boxes.length || boxes.length !== s.after.length) createBoxes(s.after);
 
-  // compare highlight: for compute functions we set swap field to indicate indices; for compare type we still use that to highlight
+  // For compare arrows: we draw arrows when swap array is present for compare/move/swap
   const compare = (s.type === 'compare' && s.swap) ? s.swap : (s.swap && s.type!=='compare' ? s.swap : null);
-  updateBoxes(s.after, s.sortedUpto, compare);
 
-  if (s.swap && s.swap[0] !== s.swap[1]) {
+  // Update boxes with s.sorted (may be null)
+  updateBoxes(s.after, s.sorted, (s.type === 'compare' && s.swap) ? s.swap : null);
+
+  // Handle preview banner and passStep text
+  removePreviewBanner();
+  if(s.type === 'pass-preview'){
+    // show PASS COMPLETED banner and change passStep text
+    showPreviewBanner();
+    document.getElementById('passStep').textContent = 'PASS COMPLETED';
+    // clear arrows
+    clearSvg();
+  } else {
+    // Normal text for pass/step
+    document.getElementById('passStep').textContent = `Pass: ${s.pass} • Step: ${s.stepInPass}`;
+  }
+
+  // Draw arrow if appropriate (not during pass-preview)
+  if (s.type !== 'pass-preview' && s.swap && s.swap[0] !== s.swap[1]) {
     if (s.type === 'swap') drawCurvedArrow(s.swap[0], s.swap[1], 'swap', 'swap');
     else if (s.type === 'compare') drawCurvedArrow(s.swap[0], s.swap[1], 'compare', 'compare');
     else if (s.type === 'move') drawCurvedArrow(s.swap[0], s.swap[1], 'move', 'shift');
+    else drawCurvedArrow(s.swap[0], s.swap[1], 'compare', '');
   } else {
-    clearSvg();
+    if(s.type !== 'pass-preview') clearSvg();
   }
 
   document.getElementById('status').textContent = `Step: ${i+1} / ${steps.length}`;
-  document.getElementById('passStep').textContent = `Pass: ${s.pass} • Step: ${s.stepInPass}`;
 }
 
 /* ---------- Playback ---------- */
@@ -525,6 +662,7 @@ window.addEventListener('resize', ()=>{ sizeSvg(); });
 document.getElementById('runBtn').addEventListener('click', ()=>{
   stopPlayback();
   clearSvg();
+  removePreviewBanner();
   const values = parseInputArray(document.getElementById('inputArray').value);
   if(values.length === 0){ alert('Enter at least one number.'); return; }
   steps = prepareSteps(values, document.getElementById('algo').value);
@@ -535,6 +673,7 @@ document.getElementById('resetBtn').addEventListener('click', ()=>{
   stopPlayback();
   steps = []; idx = 0; clearSvg();
   boxes.forEach(b=>b.remove()); boxes = [];
+  removePreviewBanner();
   document.getElementById('status').textContent = 'Step: 0 / 0';
   document.getElementById('passStep').textContent = 'Pass: 0 • Step: 0';
 });
